@@ -1,11 +1,10 @@
-// SPSC ring buffer benchmark: throughput + one-way latency.
+// SPSC ring buffer benchmark: throughput + paced one-way latency.
 //
 // Build (MSVC):
 //   cl /std:c++20 /O2 /EHsc /DNDEBUG bench.cpp /Fe:bench.exe
 //
 // Build (g++ / clang++):
 //   g++ -std=c++20 -O3 -DNDEBUG -pthread -o bench bench.cpp
-//   clang++ -std=c++20 -O3 -DNDEBUG -pthread -o bench bench.cpp
 //
 // Run:
 //   ./bench
@@ -25,57 +24,72 @@
 #include <thread>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#include <windows.h>
+#endif
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
 struct Msg {
   std::uint64_t seq;
-  std::uint64_t tsc_ns;  // producer timestamp (steady_clock ns)
+  std::uint64_t tsc_ns;
 };
 
-constexpr std::size_t kRingCapacity = 1u << 16;  // 65536 slots (65535 usable)
+constexpr std::size_t kRingCapacity = 1u << 16;  // 65536 usable slots
 
-void pin_hint(const char* which) {
-  // Soft hint only — OS may ignore. Helps reduce noise on noisy machines.
-  (void)which;
-#if defined(_WIN32)
-  // No-op: affinity APIs are available but kept out of this minimal harness.
+inline void cpu_relax() noexcept {
+#if defined(_MSC_VER)
+  _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
 #else
-  (void)which;
+  std::this_thread::yield();
+#endif
+}
+
+void pin_to_cpu(unsigned cpu) {
+#if defined(_WIN32)
+  const DWORD_PTR mask = static_cast<DWORD_PTR>(1ull << cpu);
+  SetThreadAffinityMask(GetCurrentThread(), mask);
+#else
+  (void)cpu;
 #endif
 }
 
 void bench_throughput(std::uint64_t iterations) {
-  // Heap-allocate: ring storage is ~1MB and can overflow the default Windows stack.
   auto ring = std::make_unique<SpscRing<Msg, kRingCapacity>>();
   std::atomic<bool> start{false};
   std::atomic<std::uint64_t> consumed{0};
 
   std::thread consumer([&] {
-    pin_hint("consumer");
+    pin_to_cpu(2);
     while (!start.load(std::memory_order_acquire)) {
-      // wait
+      cpu_relax();
     }
     Msg m{};
     std::uint64_t n = 0;
     while (n < iterations) {
       if (ring->try_pop(m)) {
         ++n;
+      } else {
+        cpu_relax();
       }
     }
     consumed.store(n, std::memory_order_release);
   });
 
   std::thread producer([&] {
-    pin_hint("producer");
+    pin_to_cpu(0);
     while (!start.load(std::memory_order_acquire)) {
-      // wait
+      cpu_relax();
     }
     for (std::uint64_t i = 0; i < iterations; ++i) {
       Msg m{i, 0};
       while (!ring->try_push(m)) {
-        // spin when full
+        cpu_relax();
       }
     }
   });
@@ -86,8 +100,7 @@ void bench_throughput(std::uint64_t iterations) {
   consumer.join();
   const auto t1 = Clock::now();
 
-  const double secs =
-      std::chrono::duration<double>(t1 - t0).count();
+  const double secs = std::chrono::duration<double>(t1 - t0).count();
   const double mops = (static_cast<double>(iterations) / secs) / 1e6;
 
   std::cout << "=== Throughput (SPSC) ===\n"
@@ -98,9 +111,8 @@ void bench_throughput(std::uint64_t iterations) {
             << "  consumed : " << consumed.load() << '\n';
 }
 
-void bench_latency(std::uint64_t iterations) {
-  // One-way latency: producer stamps each message; consumer records delta.
-  // Warm up first so cold-cache / thread start noise is excluded.
+void bench_latency_paced(std::uint64_t iterations) {
+  // Keep at most one message in flight so numbers reflect handoff, not backlog.
   auto ring = std::make_unique<SpscRing<Msg, kRingCapacity>>();
   std::atomic<bool> start{false};
   std::vector<std::uint64_t> samples;
@@ -109,14 +121,16 @@ void bench_latency(std::uint64_t iterations) {
   const std::uint64_t warmup = std::min<std::uint64_t>(iterations / 10, 100000);
 
   std::thread consumer([&] {
-    pin_hint("consumer");
+    pin_to_cpu(2);
     while (!start.load(std::memory_order_acquire)) {
+      cpu_relax();
     }
     Msg m{};
     std::uint64_t n = 0;
     const std::uint64_t total = warmup + iterations;
     while (n < total) {
       if (!ring->try_pop(m)) {
+        cpu_relax();
         continue;
       }
       const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -131,11 +145,15 @@ void bench_latency(std::uint64_t iterations) {
   });
 
   std::thread producer([&] {
-    pin_hint("producer");
+    pin_to_cpu(0);
     while (!start.load(std::memory_order_acquire)) {
+      cpu_relax();
     }
     const std::uint64_t total = warmup + iterations;
     for (std::uint64_t i = 0; i < total; ++i) {
+      while (ring->size_approx() > 0) {
+        cpu_relax();
+      }
       Msg m{};
       m.seq = i;
       m.tsc_ns = static_cast<std::uint64_t>(
@@ -143,6 +161,7 @@ void bench_latency(std::uint64_t iterations) {
               Clock::now().time_since_epoch())
               .count());
       while (!ring->try_push(m)) {
+        cpu_relax();
       }
     }
   });
@@ -152,22 +171,21 @@ void bench_latency(std::uint64_t iterations) {
   consumer.join();
 
   if (samples.empty()) {
-    std::cout << "=== Latency ===\n  no samples collected\n";
+    std::cout << "=== Paced one-way latency ===\n  no samples collected\n";
     return;
   }
 
   std::sort(samples.begin(), samples.end());
   const auto percentile = [&](double p) -> std::uint64_t {
-    const std::size_t idx = static_cast<std::size_t>(
-        p * static_cast<double>(samples.size() - 1));
+    const std::size_t idx =
+        static_cast<std::size_t>(p * static_cast<double>(samples.size() - 1));
     return samples[idx];
   };
 
-  const double mean =
-      std::accumulate(samples.begin(), samples.end(), 0.0) /
-      static_cast<double>(samples.size());
+  const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) /
+                      static_cast<double>(samples.size());
 
-  std::cout << "=== One-way latency (producer stamp -> consumer) ===\n"
+  std::cout << "=== Paced one-way latency (1 in-flight) ===\n"
             << "  samples  : " << samples.size() << '\n'
             << "  mean     : " << std::fixed << std::setprecision(1) << mean
             << " ns\n"
@@ -182,7 +200,7 @@ void bench_latency(std::uint64_t iterations) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::uint64_t iterations = 20'000'000;
+  std::uint64_t iterations = 50'000'000;
   if (argc > 1) {
     iterations = std::strtoull(argv[1], nullptr, 10);
     if (iterations < 1000) {
@@ -190,16 +208,15 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::cout << "SPSC ring capacity (usable): " << SpscRing<Msg, kRingCapacity>::capacity()
-            << "\n"
+  std::cout << "SPSC ring capacity (usable): "
+            << SpscRing<Msg, kRingCapacity>::capacity() << "\n"
             << "Iterations: " << iterations << "\n\n";
 
   bench_throughput(iterations);
   std::cout << '\n';
-  // Latency uses fewer messages — clock_gettime / steady_clock overhead dominates.
   const std::uint64_t latency_iters =
-      std::min<std::uint64_t>(iterations, 2'000'000);
-  bench_latency(latency_iters);
+      std::min<std::uint64_t>(iterations, 1'000'000);
+  bench_latency_paced(latency_iters);
 
   return 0;
 }
