@@ -1,0 +1,13 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+bench
+bench.exe
+.vs/
+CMakeFiles/
+cmake-build-*/
