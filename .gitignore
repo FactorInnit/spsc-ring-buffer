@@ -7,7 +7,9 @@
 *.iobj
 *.ipdb
 bench
-bench.exe
+bench_baseline
+test_correctness
+test_baseline
 .vs/
 CMakeFiles/
 cmake-build-*/

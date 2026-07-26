@@ -1,15 +1,14 @@
 // SPSC ring buffer benchmark: throughput + paced one-way latency.
 //
-// Build (MSVC):
+// Optimized (default):
 //   cl /std:c++20 /O2 /EHsc /DNDEBUG bench.cpp /Fe:bench.exe
-//
-// Build (g++ / clang++):
 //   g++ -std=c++20 -O3 -DNDEBUG -pthread -o bench bench.cpp
 //
-// Run:
-//   ./bench
-//   ./bench 50000000
+// Baseline (reproducible comparison):
+//   cl /std:c++20 /O2 /EHsc /DNDEBUG /DSPSC_BASELINE bench.cpp /Fe:bench_baseline.exe
+//   g++ -std=c++20 -O3 -DNDEBUG -pthread -DSPSC_BASELINE -o bench_baseline bench.cpp
 
+#include "cpu_affinity.hpp"
 #include "spsc_ring.hpp"
 
 #include <algorithm>
@@ -24,11 +23,6 @@
 #include <thread>
 #include <vector>
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <windows.h>
-#endif
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -38,26 +32,7 @@ struct Msg {
   std::uint64_t tsc_ns;
 };
 
-constexpr std::size_t kRingCapacity = 1u << 16;  // 65536 usable slots
-
-inline void cpu_relax() noexcept {
-#if defined(_MSC_VER)
-  _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-  __builtin_ia32_pause();
-#else
-  std::this_thread::yield();
-#endif
-}
-
-void pin_to_cpu(unsigned cpu) {
-#if defined(_WIN32)
-  const DWORD_PTR mask = static_cast<DWORD_PTR>(1ull << cpu);
-  SetThreadAffinityMask(GetCurrentThread(), mask);
-#else
-  (void)cpu;
-#endif
-}
+constexpr std::size_t kRingCapacity = 1u << 16;
 
 void bench_throughput(std::uint64_t iterations) {
   auto ring = std::make_unique<SpscRing<Msg, kRingCapacity>>();
@@ -112,7 +87,6 @@ void bench_throughput(std::uint64_t iterations) {
 }
 
 void bench_latency_paced(std::uint64_t iterations) {
-  // Keep at most one message in flight so numbers reflect handoff, not backlog.
   auto ring = std::make_unique<SpscRing<Msg, kRingCapacity>>();
   std::atomic<bool> start{false};
   std::vector<std::uint64_t> samples;
@@ -208,7 +182,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::cout << "SPSC ring capacity (usable): "
+  std::cout << "Variant: " << SpscRing<Msg, kRingCapacity>::variant() << "\n"
+            << "Affinity: " << affinity_support() << "\n"
+            << "SPSC ring capacity (usable): "
             << SpscRing<Msg, kRingCapacity>::capacity() << "\n"
             << "Iterations: " << iterations << "\n\n";
 
